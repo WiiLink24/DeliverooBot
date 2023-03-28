@@ -275,8 +275,11 @@ class OTP(discord.ui.Modal, title="Deliveroo OTP"):
         byte_val = bytes.fromhex(key)
         cipher = AES.new(OTP.KEY, AES.MODE_CBC, iv=OTP.IV)
         result = cipher.decrypt(byte_val)
-        return result.decode("utf-8")
+        return OTP._unpad(result).decode("utf-8")
 
+    @staticmethod
+    def _unpad(s):
+        return s[:-ord(s[len(s)-1:])]
 
     @staticmethod
     def encode_hex_to_str(array: bytes) -> str:
