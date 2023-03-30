@@ -3,6 +3,7 @@ import requests
 import uuid
 import base64
 import json
+import re
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from models import DeliverooUser
@@ -94,53 +95,95 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
             # Verification should only happen in DMs
             try:
                 user = self.session.query(DeliverooUser).filter_by(discord_id=str(ctx.author.id)).first()
+                if ctx.content == f"I agree to placing this order. I acknowledge that once this goes through, " \
+                                  f"there is no cancelling the order. Auth Key: {user.auth_key}":
+                    # Now we can go ahead with placing the order.
+                    r = requests.session()
+                    headers = self.base_headers
+                    headers.update(
+                        {
+                            "X-Roo-Guid": user.roo_uid,
+                            "X-Roo-Sticky-Guid": user.roo_uid,
+                            "Authorization": OTP.decrypt_auth(user.auth_token),
+                            "X-APOLLO-OPERATION-NAME": "ExecutePaymentPlan",
+                            "X-APOLLO-CACHE-FETCH-STRATEGY": "NETWORK_ONLY",
+                            "X-APOLLO-EXPIRE-TIMEOUT": "0",
+                            "X-APOLLO-EXPIRE-AFTER-READ": "false",
+                            "X-APOLLO-PREFETCH": "false",
+                            "X-APOLLO-CACHE-DO-NOT-STORE": "false",
+                        }
+                    )
+
+                    query = {
+                        "operationName": "ExecutePaymentPlan",
+                        "query": "mutation ExecutePaymentPlan($payment_plan_id: ID!, $payment_option_data: InputPaymentOptionData, $challenge_result: ChallengeResult, $table_number: String, $marketing_preference_results: MarketingPreferenceResults, $payPalDeviceData: String, $params: [InputParam!]) { result: execute_payment_plan(payment_plan_id: $payment_plan_id, payment_option_data: $payment_option_data, challenge_result: $challenge_result, capabilities: {challenge_capabilities: [OVER_18_AGE_CONFIRMATION], wallets: []}, table_number: $table_number, marketing_preferences: $marketing_preference_results, device_data: $payPalDeviceData, params: $params) { __typename order_id challenge { __typename ... on AppChallenge { title decoded_payload { __typename ... on WechatPayAppChallengeDecodedPayload { prepay_id partner_id sign timestamp nonce pkg } } } ... on BrowserChallenge { url } ... on WebChallenge { url title method } ... on ExpiryDateChallenge { title message input_error_message } ... on Over18AgeConfirmationChallenge { title message ok_cta cancel_cta } ... on PaypalReAuthChallenge { event_tracking { __typename event_name } message cancel_cta } } } }",
+                        "variables": {
+                            "payment_plan_id": user.payment_id,
+                            "payment_option_data": None,
+                            "challenge_result": None,
+                            "marketing_preference_results": {"results": []},
+                            "payPalDeviceData": None,
+                            "params": [],
+                        },
+                    }
+
+                    response = r.post(
+                        f"https://api.deliveroo.com/checkout-api/graphql-query",
+                        verify=True,
+                        headers=headers,
+                        data=json.dumps(query),
+                    )
+
+                    x = json.loads(response.text)
+                    if not x["data"]["result"]["challenge"]:
+                        await ctx.reply("Order has been placed, enjoy!")
+                    else:
+                        if x["data"]["result"]["challenge"]["__typename"] == "WebChallenge" and \
+                                x["data"]["result"]["challenge"]["method"] == "POST":
+                            # 3D Secure needed ~ Europe when money
+                            did_succeed, secure_url = self.send_3d_secure(user, x["data"]["result"]["challenge"]["url"])
+                            if did_succeed:
+                                await ctx.reply(f"3D-Secure is required to process this payment. Please visit this "
+                                                f"website provided by Deliveroo to verify. URL: {secure_url}")
+                            else:
+                                await ctx.reply("3D-Secure was required to process this payment, however retrieving "
+                                                "the URL failed. Failed to place order.")
+                        elif x["data"]["result"]["challenge"]["__typename"] == "ExpiryDateChallenge":
+                            # Challenge to validate Credit Card expiry, why does this exist I don't know.
+                            # TODO: Actually implement
+                            await ctx.reply("Deliveroo requires you to enter your Credit Card expiry address. Enter "
+                                            "it in MM/YY format.")
+                        else:
+                            await ctx.reply("Failed to place order.")
             except Exception as e:
                 await ctx.reply(content=e.with_traceback(e.__traceback__).__str__())
                 return
 
-            if ctx.content == "I agree to this charge. I acknowledge that once this goes through, there is no " \
-                              f"cancelling the order. Auth Key: {user.auth_token}":
-                # Now we can go ahead with placing the order.
-                r = requests.session()
-                headers = self.base_headers
-                headers.update(
-                    {
-                        "X-Roo-Guid": user.roo_uid,
-                        "X-Roo-Sticky-Guid": user.roo_uid,
-                        "Authorization": OTP.decrypt_auth(user.auth_token),
-                        "X-APOLLO-OPERATION-NAME": "ExecutePaymentPlan",
-                        "X-APOLLO-CACHE-FETCH-STRATEGY": "NETWORK_ONLY",
-                        "X-APOLLO-EXPIRE-TIMEOUT": "0",
-                        "X-APOLLO-EXPIRE-AFTER-READ": "false",
-                        "X-APOLLO-PREFETCH": "false",
-                        "X-APOLLO-CACHE-DO-NOT-STORE": "false",
-                    }
-                )
+    def send_3d_secure(self, user: DeliverooUser, url: str) -> tuple[bool, str]:
+        r = requests.session()
+        headers = self.base_headers
 
-                query = {
-                    "operationName": "ExecutePaymentPlan",
-                    "query": "mutation ExecutePaymentPlan($payment_plan_id: ID!, $payment_option_data: InputPaymentOptionData, $challenge_result: ChallengeResult, $table_number: String, $marketing_preference_results: MarketingPreferenceResults, $payPalDeviceData: String, $params: [InputParam!]) { result: execute_payment_plan(payment_plan_id: $payment_plan_id, payment_option_data: $payment_option_data, challenge_result: $challenge_result, capabilities: {challenge_capabilities: [OVER_18_AGE_CONFIRMATION], wallets: []}, table_number: $table_number, marketing_preferences: $marketing_preference_results, device_data: $payPalDeviceData, params: $params) { __typename order_id challenge { __typename ... on AppChallenge { title decoded_payload { __typename ... on WechatPayAppChallengeDecodedPayload { prepay_id partner_id sign timestamp nonce pkg } } } ... on BrowserChallenge { url } ... on WebChallenge { url title method } ... on ExpiryDateChallenge { title message input_error_message } ... on Over18AgeConfirmationChallenge { title message ok_cta cancel_cta } ... on PaypalReAuthChallenge { event_tracking { __typename event_name } message cancel_cta } } } }",
-                    "variables": {
-                        "payment_plan_id": user.payment_id,
-                        "payment_option_data": None,
-                        "challenge_result": None,
-                        "marketing_preference_results": {"results": []},
-                        "payPalDeviceData": None,
-                        "params": [],
-                    },
-                }
+        headers.update({
+            "X-Requested-With": "com.deliveroo.orderapp",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,"
+                      "*/*;q=0.8,application/signed-exchange;v=b3;q=0.7 "
+        })
 
-                response = r.post(
-                    f"https://api.deliveroo.com/checkout-api/graphql-query",
-                    verify=True,
-                    headers=headers,
-                    data=json.dumps(query),
-                )
+        red_domain = "deliveroo.com"
+        # getting domain
+        regURL = re.findall("^(?:https?:\/\/)?(?:[^@\/\n]+@)?(?:www\.)?([^:\/\n]+)", url)
+        if len(regURL) != 0:
+            red_domain = regURL[0]
 
-                if response.status_code == 200:
-                    await ctx.reply("Order has been placed, enjoy!")
-                else:
-                    await ctx.reply("Order failed. Please report to Sketch#4374.")
+        r.cookies.set("api_auth", OTP.decrypt_auth(user.auth_token).replace("Basic ", ""), domain=red_domain, path="/")
+        r.cookies.set("roo_guid", user.roo_uid, domain=red_domain, path="/")
+
+        response = r.post(url, verify=True, headers=headers, allow_redirects=False)
+        if response.status_code == 302:
+            return True, response.headers["Location"]
+        else:
+            return False, ""
 
     @app_commands.command(name="login", description="Attempt to login to Deliveroo")
     @app_commands.guilds(Object(id=997708022778450020))
@@ -193,8 +236,6 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
         response = r.post("https://api.deliveroo.com/orderapp/v1/session", verify=True, headers=headers,
                           data=json.dumps({"first_install": True}))
 
-        print(response.text)
-        print(response.status_code)
         if response.status_code != 201:
             await interaction.followup.send(content="Failed to initiate session.")
             return
@@ -216,8 +257,6 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
         response = r.post("https://api.deliveroo.com/orderapp/v1/login?track=1", verify=True, headers=headers,
                           data=json.dumps({"client_type": "orderapp_android"}))
 
-        print(response.status_code)
-        print(response.text)
         if response.status_code != 423:
             await interaction.followup.send(content="Failed to login.")
             return
@@ -277,9 +316,10 @@ class OTP(discord.ui.Modal, title="Deliveroo OTP"):
         result = cipher.decrypt(byte_val)
         return OTP._unpad(result).decode("utf-8")
 
+
     @staticmethod
     def _unpad(s):
-        return s[:-ord(s[len(s)-1:])]
+        return s[:-ord(s[len(s) - 1:])]
 
     @staticmethod
     def encode_hex_to_str(array: bytes) -> str:
@@ -305,11 +345,6 @@ class OTP(discord.ui.Modal, title="Deliveroo OTP"):
             }
         )
 
-        print(self.auth)
-        print(self.mfa)
-        print(self.name.value)
-        print(type(self.name.value))
-
         data = {
             "challenge": "sms:passcode",
             "client_type": "orderapp_android",
@@ -324,8 +359,6 @@ class OTP(discord.ui.Modal, title="Deliveroo OTP"):
             data=json.dumps(data),
         )
 
-        print(response.text)
-        print(response.status_code)
         if response.status_code != 200:
             await interaction.followup.send(content="Failed to verify OTP", ephemeral=True)
             return
