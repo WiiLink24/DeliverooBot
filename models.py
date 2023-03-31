@@ -31,5 +31,6 @@ class DeliverooUser(DeliverooBase):
     email = Column(String)
     password = Column(String)
     auth_token = Column(String)
+    auth_key = Column(String)
     roo_uid = Column(String)
     payment_id = Column(String)
