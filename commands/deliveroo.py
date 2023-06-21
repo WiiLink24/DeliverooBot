@@ -134,9 +134,12 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
                         data=json.dumps(query),
                     )
 
+                    print(OTP.decrypt_auth(user.auth_token))
                     x = json.loads(response.text)
+                    print(response.text)
                     if not x["data"]["result"]["challenge"]:
                         await ctx.reply("Order has been placed, enjoy!")
+                        self.report_order_success(str(ctx.author.id))
                     else:
                         if x["data"]["result"]["challenge"]["__typename"] == "WebChallenge" and \
                                 x["data"]["result"]["challenge"]["method"] == "POST":
@@ -148,6 +151,7 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
                             else:
                                 await ctx.reply("3D-Secure was required to process this payment, however retrieving "
                                                 "the URL failed. Failed to place order.")
+                                self.report_error(str(ctx.author.id), "3D-Secure", response.text)
                         elif x["data"]["result"]["challenge"]["__typename"] == "ExpiryDateChallenge":
                             # Challenge to validate Credit Card expiry, why does this exist I don't know.
                             # TODO: Actually implement
@@ -155,8 +159,12 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
                                             "it in MM/YY format.")
                         else:
                             await ctx.reply("Failed to place order.")
+                            self.report_error(str(ctx.author.id), "Checkout", response.text)
+
+                        self.report_order_success(str(ctx.author.id))
             except Exception as e:
                 await ctx.reply(content=e.with_traceback(e.__traceback__).__str__())
+                self.report_error(str(ctx.author.id), "Exception", response.text)
                 return
 
     def send_3d_secure(self, user: DeliverooUser, url: str) -> tuple[bool, str]:
@@ -236,6 +244,8 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
         response = r.post("https://api.deliveroo.com/orderapp/v1/session", verify=True, headers=headers,
                           data=json.dumps({"first_install": True}))
 
+        print(response.text)
+        print(response.status_code)
         if response.status_code != 201:
             await interaction.followup.send(content="Failed to initiate session.")
             return
@@ -257,6 +267,8 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
         response = r.post("https://api.deliveroo.com/orderapp/v1/login?track=1", verify=True, headers=headers,
                           data=json.dumps({"client_type": "orderapp_android"}))
 
+        print(response.status_code)
+        print(response.text)
         if response.status_code != 423:
             await interaction.followup.send(content="Failed to login.")
             return
@@ -290,6 +302,38 @@ class Deliveroo(commands.GroupCog, name="deliveroo"):
     async def otp(self, interaction: Interaction):
         cache = self.cache[interaction.user.id]
         await interaction.response.send_modal(OTP(cache.auth, cache.mfa, cache.cookies, cache.uid, self.session))
+
+    @staticmethod
+    def report_error(discord_id, part, resp):
+        payload = {
+            "content": None,
+            "embeds": [
+                {
+                    "title": "An error has occurred in Demae Deliveroo!",
+                    "description": f"Failed to place order at {part}\nDiscord ID: {discord_id}\nResponse: {resp}",
+                    "color": 16711711,
+                }
+            ]
+        }
+
+        requests.post("", json=payload, headers={"Content-Type": "application/json"})
+
+    @staticmethod
+    def report_order_success(discord_id: str):
+        payload = {
+            "content": None,
+            "embeds": [
+                {
+                    "title": "Order Placed!",
+                    "description": f"The order was successfully placed by Discord ID: {discord_id}",
+                    "color": 65311,
+                }
+            ]
+        }
+
+        resp = requests.post("", json=payload, headers={"Content-Type": "application/json"})
+        print(resp.text)
+        print(resp.status_code)
 
 
 class OTP(discord.ui.Modal, title="Deliveroo OTP"):
@@ -345,6 +389,11 @@ class OTP(discord.ui.Modal, title="Deliveroo OTP"):
             }
         )
 
+        print(self.auth)
+        print(self.mfa)
+        print(self.name.value)
+        print(type(self.name.value))
+
         data = {
             "challenge": "sms:passcode",
             "client_type": "orderapp_android",
@@ -359,6 +408,8 @@ class OTP(discord.ui.Modal, title="Deliveroo OTP"):
             data=json.dumps(data),
         )
 
+        print(response.text)
+        print(response.status_code)
         if response.status_code != 200:
             await interaction.followup.send(content="Failed to verify OTP", ephemeral=True)
             return
